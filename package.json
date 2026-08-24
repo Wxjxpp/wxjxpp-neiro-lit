@@ -1,0 +1,17 @@
+{
+  "name": "neiro-lit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Neiro 一起听服务端 · Cloudflare Workers / Vercel 双平台",
+  "scripts": {
+    "test": "node test/protocol.test.mjs",
+    "dev:cf": "wrangler dev",
+    "deploy:cf": "wrangler deploy",
+    "dev:vercel": "vercel dev",
+    "deploy:vercel": "vercel deploy --prod"
+  },
+  "devDependencies": {
+    "wrangler": "^3.90.0"
+  }
+}

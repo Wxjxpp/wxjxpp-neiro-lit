@@ -1,0 +1,16 @@
+name = "neiro-lit"
+main = "src/cloudflare/worker.js"
+compatibility_date = "2025-01-01"
+
+# 每个房间一个 Durable Object（SQLite 持久化）
+[[durable_objects.bindings]]
+name = "ROOMS"
+class_name = "ListeningRoomDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ListeningRoomDO"]
+
+[vars]
+# 生产环境请用: wrangler secret put LISTEN_TOGETHER_TOKEN_SECRET
+# LISTEN_TOGETHER_TOKEN_SECRET = ""

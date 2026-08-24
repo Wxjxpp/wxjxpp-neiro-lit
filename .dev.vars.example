@@ -1,0 +1,2 @@
+# Cloudflare 本地开发密钥（cp .dev.vars.example .dev.vars 后修改）
+LISTEN_TOGETHER_TOKEN_SECRET=please-change-me-to-a-long-random-string
