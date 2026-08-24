@@ -13,6 +13,7 @@
  *   GET    /api/rooms/:id/ws?token=...    WebSocket 实时同步
  *   GET    /healthz                       健康检查
  */
+import { DurableObject } from 'cloudflare:workers'
 import {
   applyEvent, createRoomState, expectedPositionMs, genRoomId, genSecret,
   joinRoom, leaveRoom, publicState, signToken, verifyToken,
@@ -37,13 +38,16 @@ function bearerToken(request, url) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     if (request.method === 'OPTIONS') return new Response(null, { headers: CORS })
     const url = new URL(request.url)
 
     if (url.pathname === '/healthz') return json({ ok: true, service: 'neiro-lit' })
-    if (!env.LISTEN_TOGETHER_TOKEN_SECRET) {
-      return err('服务端未配置 LISTEN_TOGETHER_TOKEN_SECRET', 500)
+
+    // 密钥零配置：未设置环境变量时自动生成并持久化（重启不丢，跨实例一致）
+    let tokenSecret = env.LISTEN_TOGETHER_TOKEN_SECRET
+    if (!tokenSecret) {
+      tokenSecret = await env.ROOMS.get(env.ROOMS.idFromName('__secret__')).getOrCreateTokenSecret()
     }
 
     const m = url.pathname.match(/^\/api\/rooms\/([A-Za-z0-9]{6})(\/(ws|state|join|leave|control))?$/)
@@ -58,14 +62,13 @@ export default {
       let roomId = ''
       for (let i = 0; i < 8; i++) {
         const candidate = genRoomId()
-        const probe = await env.ROOMS.idFromName(candidate)
-        const stub = env.ROOMS.get(probe)
+        const stub = env.ROOMS.get(env.ROOMS.idFromName(candidate))
         const exists = await stub.roomExists().catch(() => false)
         if (!exists) { roomId = candidate; break }
       }
       if (!roomId) return err('房间号分配失败，请重试', 503)
       const stub = env.ROOMS.get(env.ROOMS.idFromName(roomId))
-      return stub.handleCreate({ nickname, tokenSecret: env.LISTEN_TOGETHER_TOKEN_SECRET })
+      return stub.handleCreate({ nickname, tokenSecret })
     }
 
     const roomId = m[1].toUpperCase()
@@ -73,12 +76,16 @@ export default {
     const stub = env.ROOMS.get(env.ROOMS.idFromName(roomId))
 
     if (action === 'ws') {
-      const auth = await verifyToken(env.LISTEN_TOGETHER_TOKEN_SECRET, url.searchParams.get('token'))
+      const auth = await verifyToken(tokenSecret, url.searchParams.get('token'))
       if (!auth || auth.roomId !== roomId) return err('token 无效', 401)
-      return stub.handleWs(auth.memberId)
+      // WebSocket 升级必须转发原始请求（WebSocketPair 无法跨 RPC 边界传递）
+      const fwd = new URL(url)
+      fwd.pathname = '/ws'
+      fwd.searchParams.set('memberId', auth.memberId)
+      return stub.fetch(fwd.toString())
     }
 
-    const auth = await verifyToken(env.LISTEN_TOGETHER_TOKEN_SECRET, bearerToken(request, url))
+    const auth = await verifyToken(tokenSecret, bearerToken(request, url))
     if ((action === 'state' || action === 'control' || action === 'leave') &&
         (!auth || auth.roomId !== roomId)) return err('token 无效', 401)
 
@@ -87,7 +94,7 @@ export default {
       return stub.handleJoin({
         nickname: String(body.nickname || ''),
         secret: String(body.secret || ''),
-        tokenSecret: env.LISTEN_TOGETHER_TOKEN_SECRET,
+        tokenSecret,
       })
     }
     if (action === 'state' && request.method === 'GET') return stub.handleState()
@@ -102,25 +109,37 @@ export default {
 }
 
 /** 每个房间一个 Durable Object：持久化房态 + WebSocket 广播。 */
-export class ListeningRoomDO {
-  constructor(state) {
-    this.state = state
+export class ListeningRoomDO extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env)
+    this.ctx = ctx
+    this.env = env
     this.room = null // 惰性加载
   }
 
   async load() {
     if (this.room !== null) return this.room
-    this.room = (await this.state.storage.get('state')) || null
+    this.room = (await this.ctx.storage.get('state')) || null
     return this.room
   }
 
   async save() {
-    await this.state.storage.put('state', this.room)
+    await this.ctx.storage.put('state', this.room)
   }
 
   /** 房间是否已被创建过。 */
   async roomExists() {
     return (await this.load()) !== null
+  }
+
+  /** 密钥零配置：专用 DO 实例持久化全局 Token 密钥。 */
+  async getOrCreateTokenSecret() {
+    let secret = await this.ctx.storage.get('tokenSecret')
+    if (!secret) {
+      secret = genSecret() + genSecret() + Date.now().toString(36)
+      await this.ctx.storage.put('tokenSecret', secret)
+    }
+    return secret
   }
 
   response(data, status = 200) { return json(data, status) }
@@ -132,12 +151,12 @@ export class ListeningRoomDO {
     const joinSecret = genSecret()
     const memberSecret = genSecret()
     const state = createRoomState({ roomId: '', hostMemberId, nickname, nowMs })
-    state.roomId = this.state.id.name || ''
+    state.roomId = this.ctx.id.name || ''
     state.joinSecret = joinSecret
     state.members[hostMemberId].memberSecret = memberSecret
     this.room = state
     await this.save()
-    await this.state.storage.setAlarm(Date.now() + 60_000)
+    await this.ctx.storage.setAlarm(Date.now() + 60_000)
     const token = await signToken(tokenSecret, state.roomId, hostMemberId, nowMs)
     return this.response({
       ok: true,
@@ -178,6 +197,23 @@ export class ListeningRoomDO {
     })
   }
 
+  /** WebSocket 升级（由 Worker 经 stub.fetch 转发进来）。 */
+  async fetch(request) {
+    const url = new URL(request.url)
+    if (url.pathname !== '/ws') return err('not found', 404)
+    const memberId = url.searchParams.get('memberId') || ''
+    const room = await this.load()
+    if (!room || room.closed || !room.members[memberId]) return err('房间不可用', 404)
+    const pair = new WebSocketPair()
+    this.ctx.acceptWebSocket(pair[1], [memberId])
+    pair[1].send(JSON.stringify({
+      type: 'welcome',
+      memberId,
+      state: publicState(room, Date.now()),
+    }))
+    return new Response(null, { status: 101, webSocket: pair[0] })
+  }
+
   async handleState() {
     const room = await this.load()
     if (!room || room.closed) return err('房间不存在或已关闭', 404)
@@ -202,26 +238,13 @@ export class ListeningRoomDO {
     await this.save()
     if (r.closed) {
       await this.closeAll('房主已离开，房间关闭')
-      await this.state.storage.deleteAlarm()
-      await this.state.storage.deleteAll()
+      await this.ctx.storage.deleteAlarm()
+      await this.ctx.storage.deleteAll()
       this.room = null
       return this.response({ ok: true, closed: true })
     }
     await this.broadcast()
     return this.response({ ok: true, closed: false })
-  }
-
-  async handleWs(memberId) {
-    const room = await this.load()
-    if (!room || room.closed || !room.members[memberId]) return err('房间不可用', 404)
-    const pair = new WebSocketPair()
-    this.state.acceptWebSocket(pair[1], [memberId])
-    pair[1].send(JSON.stringify({
-      type: 'welcome',
-      memberId,
-      state: publicState(room, Date.now()),
-    }))
-    return new Response(null, { status: 101, webSocket: pair[0] })
   }
 
   /** 向所有在线成员广播最新权威房态。 */
@@ -232,11 +255,11 @@ export class ListeningRoomDO {
       type: 'room_state_updated',
       state: publicState(room, Date.now()),
     })
-    for (const ws of this.state.getWebSockets()) ws.send(msg)
+    for (const ws of this.ctx.getWebSockets()) ws.send(msg)
   }
 
   async closeAll(reason) {
-    for (const ws of this.state.getWebSockets()) {
+    for (const ws of this.ctx.getWebSockets()) {
       try { ws.close(1000, reason) } catch { /* 已关闭 */ }
     }
   }
@@ -247,7 +270,7 @@ export class ListeningRoomDO {
     if (!room || room.closed) { ws.close(1000, '房间已关闭'); return }
     let data
     try { data = JSON.parse(message) } catch { return }
-    const tags = this.state.getTags(ws)
+    const tags = this.ctx.getTags(ws)
     const memberId = tags[0]
     if (data.type === 'np_ping') {
       ws.send(JSON.stringify({ type: 'np_pong', nowMs: Date.now() }))
@@ -287,11 +310,11 @@ export class ListeningRoomDO {
       await this.save()
       await this.broadcast()
       await this.closeAll('房主长时间离线，自动关房')
-      await this.state.storage.deleteAll()
+      await this.ctx.storage.deleteAll()
       this.room = null
       return
     }
     await this.broadcast() // 让听众知道房主离线状态变化
-    await this.state.storage.setAlarm(nowMs + 30_000)
+    await this.ctx.storage.setAlarm(nowMs + 30_000)
   }
 }
