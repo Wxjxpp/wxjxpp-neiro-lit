@@ -71,8 +71,8 @@ export function validTrack(track) {
     Number.isFinite(track.durationMs) && track.durationMs >= 0
 }
 
-function sanitizeTrack(t) {
-  return {
+function sanitizeTrack(t, keepPayload = false) {
+  const out = {
     stableKey: stableKeyOf(t),
     songId: String(t.songId),
     sourceId: String(t.sourceId),
@@ -82,6 +82,12 @@ function sanitizeTrack(t) {
     durationMs: Math.max(0, Math.round(t.durationMs || 0)),
     cover: typeof t.cover === 'string' ? t.cover.slice(0, 500) : '',
   }
+  // payload：平台搜索原始 JSON（听众端音源脚本取流必需）。
+  // 只随当前曲目透传（上限 16KB），不进队列，避免房态无限膨胀。
+  if (keepPayload && typeof t.payload === 'string' && t.payload.length > 0 && t.payload.length <= 16384) {
+    out.payload = t.payload
+  }
+  return out
 }
 
 export function createRoomState({ roomId, hostMemberId, nickname, nowMs }) {
@@ -267,7 +273,7 @@ function applyControl(state, action, evt, nowMs) {
       p.currentIndex = idx >= 0 ? idx : p.queue.findIndex(
         (x) => x.stableKey === stableKeyOf(t),
       )
-      p.track = sanitizeTrack(t)
+      p.track = sanitizeTrack(t, true) // 当前曲目保留 payload 供听众取流
       const shouldPlay = evt.shouldPlay === undefined ? true : !!evt.shouldPlay
       p.basePositionMs = Math.max(0, Number(evt.positionMs) || 0)
       p.anchoredAtMs = nowMs
