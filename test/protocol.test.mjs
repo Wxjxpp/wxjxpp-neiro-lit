@@ -247,6 +247,30 @@ assert.match(genRoomId(), /^[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{6}$/)
   applyEvent(state, host, { type: 'SEEK', positionMs: 999_999_999 }, NOW)
   assert.equal(state.playback.basePositionMs, 999_999_999)
 }
+// --- 群友 REQUEST_ADD_SONG 正常点歌（上一轮 bug 回归测试）---
+{
+  const { state, host } = newRoom()
+  applyEvent(state, host, {
+    type: 'SET_TRACK', positionMs: 0,
+    track: { sourceId: 'url', url: 'https://a.com/cur.mp3', title: '当前' },
+  }, NOW)
+  const m1 = joinListener(state, '小明', NOW + 1)
+  const r = applyEvent(state, m1, {
+    type: 'REQUEST_ADD_SONG',
+    track: { sourceId: 'url', url: 'https://e.com/new.mp3', title: '新歌' },
+  }, NOW + 2)
+  assert.ok(r.ok, r.error)
+  // SET_TRACK 未带 queue，故队列只有新点的一首
+  assert.equal(state.playback.queue.length, 1)
+  assert.equal(state.playback.queue[0].stableKey, `url:${urlHash('https://e.com/new.mp3')}`)
+  // 锁定加歌后群友被拒
+  applyEvent(state, host, { type: 'UPDATE_SETTINGS', settings: { lockAddSongs: true } }, NOW + 3)
+  const r2 = applyEvent(state, m1, {
+    type: 'REQUEST_ADD_SONG',
+    track: { sourceId: 'url', url: 'https://e.com/new2.mp3', title: '新歌2' },
+  }, NOW + 4)
+  assert.equal(r2.ok, false)
+}
 // --- 播完自动切歌（房主离线也推进）---
 {
   const { state, host } = newRoom()

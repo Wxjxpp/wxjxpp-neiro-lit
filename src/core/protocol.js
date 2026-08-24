@@ -398,11 +398,13 @@ export function applyEvent(state, actorId, evt, nowMs) {
   // ---- 群友请求（受门控：加歌只需未锁定；其余需房主开启成员控制）----
   if (REQUEST_EVENTS.has(type)) {
     const action = type.slice(8)
-    if (action !== 'ADD_SONG' && !state.settings.allowMemberControl) {
+    // 点歌与无效源上报不依赖房主设置（基础功能与安全兜底）
+    if (action !== 'ADD_SONG' && action !== 'TRACK_ERROR' && !state.settings.allowMemberControl) {
       return { ok: false, error: '房主未开启成员控制' }
     }
-    // 加歌不要求房主在线；其余控制类请求需要房主在线兜底
-    if (action !== 'ADD_SONG' && !controllerOnline(state, nowMs)) return { ok: false, error: '房主不在线' }
+    // 点歌/无效源上报也不要求房主在线；其余控制类请求需要房主在线兜底
+    if (action !== 'ADD_SONG' && action !== 'TRACK_ERROR' &&
+        !controllerOnline(state, nowMs)) return { ok: false, error: '房主不在线' }
     if (MEMBER_CONTROLLED.has(type)) {
       const want = evt.requestTrackStableKey || (evt.track && stableKeyOf(evt.track)) || ''
       const cur = state.playback.track
