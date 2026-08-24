@@ -325,6 +325,20 @@ function maybeDemocraticSkip(state, nowMs) {
   return false
 }
 /**
+ * 播完自动切歌（时间轴驱动，房主离线也会推进）。
+ * 由平台层在轮询路径与事件路径调用；时长未知(0)不推进。
+ * @returns 是否发生了切歌（调用方据此决定是否落盘）
+ */
+export function advanceIfTrackEnded(state, nowMs) {
+  const p = state.playback
+  if (state.closed || !p.playing || !p.track || !p.track.durationMs) return false
+  if (nowMs - p.anchoredAtMs >= p.track.durationMs) {
+    skipNext(state, nowMs)
+    return true
+  }
+  return false
+}
+/**
  * 应用一个控制/请求事件（纯函数，直接改写传入 state 并递增 version）。
  * 返回 {ok} 或 {ok:false, error}。
  */
@@ -333,6 +347,7 @@ export function applyEvent(state, actorId, evt, nowMs) {
   const actor = state.members[actorId]
   if (!actor) return { ok: false, error: '不是房间成员' }
   actor.lastSeenMs = nowMs
+  advanceIfTrackEnded(state, nowMs)
   // 幂等/乱序防护：同一成员的事件序号必须递增（HEARTBEAT/VOTE 除外——需幂等重试安全）
   if (evt.type !== 'HEARTBEAT' && evt.type !== 'VOTE') {
     const seq = Number(evt.clientSequence)
@@ -349,6 +364,10 @@ export function applyEvent(state, actorId, evt, nowMs) {
     if (type === 'VOTE') {
       const p = state.playback
       if (!p.track) return { ok: false, error: '当前没有播放中的歌曲' }
+      // 房主不参与投票：民主切歌只统计群友，避免房主一票定生死
+      if (actor.role === 'controller') {
+        return { ok: false, error: '房主不参与投票（切歌只看群友）' }
+      }
       const vote = evt.vote === 'up' ? 'up' : evt.vote === 'down' ? 'down' : null
       if (!vote) return { ok: false, error: 'vote 仅接受 up/down' }
       if (state.votes.up.includes(actorId) || state.votes.down.includes(actorId)) {

@@ -7,7 +7,7 @@
 import {
   applyEvent, createRoomState, genRoomId, genSecret,
   joinRoom, leaveRoom, publicState, signToken, verifyToken,
-  CONTROLLER_OFFLINE_MS, ROOM_AUTO_CLOSE_MS,
+  CONTROLLER_OFFLINE_MS, ROOM_AUTO_CLOSE_MS, advanceIfTrackEnded,
 } from '../../core/protocol.js'
 import { probeAudioUrl } from '../../core/probe.js'
 import { RoomStore } from '../store.js'

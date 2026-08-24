@@ -90,10 +90,13 @@ assert.match(genRoomId(), /^[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{6}$/)
   }, NOW)
   const m1 = joinListener(state, 'A', NOW + 1)
   const m2 = joinListener(state, 'B', NOW + 2)
-  // 在线 3 人，阈值默认 50% → 需要 ≥1.5 即 2 踩
-  applyEvent(state, host, { type: 'VOTE', vote: 'down' }, NOW + 3)
-  assert.equal(state.votes.down.length, 1) // 未达阈值
+  // 在线 3 人（房主+2群友），阈值默认 50% → 需要 ≥1.5 即 2 踩
+  // 房主不能投票
+  const hostVote = applyEvent(state, host, { type: 'VOTE', vote: 'down' }, NOW + 3)
+  assert.equal(hostVote.ok, false)
   applyEvent(state, m1, { type: 'VOTE', vote: 'down' }, NOW + 4)
+  assert.equal(state.votes.down.length, 1) // 未达阈值
+  applyEvent(state, m2, { type: 'VOTE', vote: 'down' }, NOW + 5)
   // 达阈值：立即切歌 + 投票清零
   assert.equal(state.playback.track.stableKey, `url:${urlHash('https://a.com/2.mp3')}`)
   assert.equal(state.votes.down.length, 0)
@@ -126,8 +129,9 @@ assert.match(genRoomId(), /^[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{6}$/)
     queue: [{ sourceId: 'url', url: 'https://a.com/1.mp3', title: '1' }],
     track: { sourceId: 'url', url: 'https://a.com/1.mp3', title: '1' },
   }, NOW)
-  applyEvent(state, host, { type: 'VOTE', vote: 'up' }, NOW + 1)
-  const dup = applyEvent(state, host, { type: 'VOTE', vote: 'down' }, NOW + 2)
+  const m1 = joinListener(state, '小明', NOW)
+  applyEvent(state, m1, { type: 'VOTE', vote: 'up' }, NOW + 1)
+  const dup = applyEvent(state, m1, { type: 'VOTE', vote: 'down' }, NOW + 2)
   assert.equal(dup.ok, false)
   assert.equal(state.votes.up.length, 1)
 }
@@ -242,6 +246,24 @@ assert.match(genRoomId(), /^[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{6}$/)
   assert.equal(expectedPositionMs(state, NOW + 10_000), 10_000)
   applyEvent(state, host, { type: 'SEEK', positionMs: 999_999_999 }, NOW)
   assert.equal(state.playback.basePositionMs, 999_999_999)
+}
+// --- 播完自动切歌（房主离线也推进）---
+{
+  const { state, host } = newRoom()
+  applyEvent(state, host, {
+    type: 'SET_TRACK', positionMs: 0,
+    queue: [
+      { sourceId: 'url', url: 'https://a.com/1.mp3', title: '1' },
+      { sourceId: 'url', url: 'https://a.com/2.mp3', title: '2' },
+    ],
+    track: { sourceId: 'url', url: 'https://a.com/1.mp3', title: '1', durationMs: 1000 },
+  }, NOW)
+  assert.equal(state.playback.playing, true)
+  // 模拟房主离线后群友活动（聊天）触发推进
+  const m1 = joinListener(state, 'A', NOW + 100)
+  const r = applyEvent(state, m1, { type: 'CHAT', text: '推进' }, NOW + 1500)
+  assert.ok(r.ok, r.error)
+  assert.equal(state.playback.track.stableKey, `url:${urlHash('https://a.com/2.mp3')}`)
 }
 // --- 脱敏快照 ---
 {

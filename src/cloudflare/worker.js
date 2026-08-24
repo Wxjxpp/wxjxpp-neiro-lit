@@ -17,7 +17,7 @@ import { DurableObject } from 'cloudflare:workers'
 import {
   applyEvent, createRoomState, expectedPositionMs, genRoomId, genSecret,
   joinRoom, leaveRoom, publicState, signToken, verifyToken,
-  CONTROLLER_OFFLINE_MS, ROOM_AUTO_CLOSE_MS,
+  CONTROLLER_OFFLINE_MS, ROOM_AUTO_CLOSE_MS, advanceIfTrackEnded,
 } from '../core/protocol.js'
 import { probeAudioUrl } from '../core/probe.js'
 
@@ -220,21 +220,21 @@ export class ListeningRoomDO extends DurableObject {
     return new Response(null, { status: 101, webSocket: pair[0] })
   }
 
-  async handleState(memberId) {
+async handleState(memberId) {
     const room = await this.load()
     if (!room || room.closed) return err('房间不存在或已关闭', 404)
+    const m0 = room.members[memberId]
+    if (!m0) return err('你已被移出房间', 403)
     // 轮询即心跳：刷新请求者在线状态（修复纯轮询客户端被误标离线）
-    const m = memberId && room.members[memberId]
-    if (m) {
-      m.lastSeenMs = Date.now()
-      await this.save()
-    }
+    m0.lastSeenMs = Date.now()
+    await this.save()
     return this.response({ ok: true, state: publicState(room, Date.now()) })
   }
 
   async handleControl(memberId, evt) {
     const room = await this.load()
     if (!room || room.closed) return err('房间不存在或已关闭', 404)
+    if (!room.members[memberId]) return err('你已被移出房间', 403)
     // URL 加歌：先探测可用性（确保传上去就能播），失败拒绝并给出原因
     if (evt?.type === 'ADD_SONG' && evt.track?.sourceId === 'url') {
       const probe = await probeAudioUrl(evt.track.url)
