@@ -17,7 +17,9 @@ import { DurableObject } from 'cloudflare:workers'
 import {
   applyEvent, createRoomState, expectedPositionMs, genRoomId, genSecret,
   joinRoom, leaveRoom, publicState, signToken, verifyToken,
+  CONTROLLER_OFFLINE_MS, ROOM_AUTO_CLOSE_MS,
 } from '../core/protocol.js'
+import { probeAudioUrl } from '../core/probe.js'
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -50,7 +52,7 @@ export default {
       tokenSecret = await env.ROOMS.get(env.ROOMS.idFromName('__secret__')).getOrCreateTokenSecret()
     }
 
-    const m = url.pathname.match(/^\/api\/rooms\/([A-Za-z0-9]{6})(\/(ws|state|join|leave|control))?$/)
+    const m = url.pathname.match(/^\/api\/rooms\/([A-Za-z0-9]{6})(\/(ws|state|join|leave|control|kick))?$/)
     if (!m && url.pathname !== '/api/rooms') return err('not found', 404)
 
     // 创建房间
@@ -97,10 +99,14 @@ export default {
         tokenSecret,
       })
     }
-    if (action === 'state' && request.method === 'GET') return stub.handleState()
+    if (action === 'state' && request.method === 'GET') return stub.handleState(auth.memberId)
     if (action === 'control' && request.method === 'POST') {
       const body = await request.json().catch(() => ({}))
       return stub.handleControl(auth.memberId, body.event || body)
+    }
+    if (action === 'kick' && request.method === 'POST') {
+      const body = await request.json().catch(() => ({}))
+      return stub.kickMember(auth.memberId, String(body.targetId || ''))
     }
     if (action === 'leave' && request.method === 'POST') return stub.handleLeave(auth.memberId)
 
@@ -214,16 +220,39 @@ export class ListeningRoomDO extends DurableObject {
     return new Response(null, { status: 101, webSocket: pair[0] })
   }
 
-  async handleState() {
+  async handleState(memberId) {
     const room = await this.load()
     if (!room || room.closed) return err('房间不存在或已关闭', 404)
+    // 轮询即心跳：刷新请求者在线状态（修复纯轮询客户端被误标离线）
+    const m = memberId && room.members[memberId]
+    if (m) {
+      m.lastSeenMs = Date.now()
+      await this.save()
+    }
     return this.response({ ok: true, state: publicState(room, Date.now()) })
   }
 
   async handleControl(memberId, evt) {
     const room = await this.load()
     if (!room || room.closed) return err('房间不存在或已关闭', 404)
+    // URL 加歌：先探测可用性（确保传上去就能播），失败拒绝并给出原因
+    if (evt?.type === 'ADD_SONG' && evt.track?.sourceId === 'url') {
+      const probe = await probeAudioUrl(evt.track.url)
+      if (!probe.ok) return err(`URL 不可用：${probe.reason}`, 422)
+    }
     const r = applyEvent(room, memberId, evt, Date.now())
+    if (!r.ok) return err(r.error, 409)
+    await this.save()
+    await this.broadcast()
+    return this.response({ ok: true, state: publicState(room, Date.now()) })
+  }
+  /** 房主踢人。 */
+  async kickMember(hostMemberId, targetId) {
+    const room = await this.load()
+    if (!room || room.closed) return err('房间不存在或已关闭', 404)
+    if (room.members[hostMemberId]?.role !== 'controller') return err('仅房主可操作', 403)
+    const evt = { type: 'KICK', targetId }
+    const r = applyEvent(room, hostMemberId, evt, Date.now())
     if (!r.ok) return err(r.error, 409)
     await this.save()
     await this.broadcast()
@@ -272,14 +301,21 @@ export class ListeningRoomDO extends DurableObject {
     try { data = JSON.parse(message) } catch { return }
     const tags = this.ctx.getTags(ws)
     const memberId = tags[0]
+    const m = room.members[memberId]
     if (data.type === 'np_ping') {
       ws.send(JSON.stringify({ type: 'np_pong', nowMs: Date.now() }))
-      const m = room.members[memberId]
-      if (m) m.lastSeenMs = Date.now()
-      await this.save()
+      if (m) { m.lastSeenMs = Date.now(); await this.save() }
       return
     }
     if (data.type === 'event' && data.event) {
+      // URL 加歌：先探测可用性
+      if (data.event.type === 'ADD_SONG' && data.event.track?.sourceId === 'url') {
+        const probe = await probeAudioUrl(data.event.track.url)
+        if (!probe.ok) {
+          ws.send(JSON.stringify({ type: 'event_rejected', error: `URL 不可用：${probe.reason}` }))
+          return
+        }
+      }
       const r = applyEvent(room, memberId, data.event, Date.now())
       if (r.ok) {
         await this.save()
@@ -289,32 +325,35 @@ export class ListeningRoomDO extends DurableObject {
       }
     }
   }
-
   async webSocketClose() { /* 成员保留以支持重连 */ }
-
-  /** 定时器：控制者离线检测与自动关房。 */
+  /**
+   * 定时器：全员离线检测与自动关房。
+   * 房间存活条件 = 有成员在线；房主离线超过 ROOM_AUTO_CLOSE_MS 或全员离线 → 关房。
+   */
   async alarm() {
     const room = await this.load()
     if (!room || room.closed) return
     const nowMs = Date.now()
-    const c = room.members[room.controllerId]
-    if (c && (nowMs - c.lastSeenMs) >= 45_000) {
-      room.controllerOfflineSinceMs ??= c.lastSeenMs
-    } else {
+    const anyOnline = Object.values(room.members)
+      .some((x) => nowMs - x.lastSeenMs < CONTROLLER_OFFLINE_MS)
+    if (anyOnline) {
       delete room.controllerOfflineSinceMs
+      await this.ctx.storage.setAlarm(nowMs + 30_000)
+      await this.save()
+      return
     }
+    // 全员离线：记录起点，超过宽限期自动关房释放存储
+    room.controllerOfflineSinceMs ??= nowMs
     await this.save()
-    if (room.controllerOfflineSinceMs &&
-        nowMs - room.controllerOfflineSinceMs > 600_000) {
+    if (nowMs - room.controllerOfflineSinceMs >= ROOM_AUTO_CLOSE_MS) {
       room.closed = true
       await this.save()
-      await this.broadcast()
-      await this.closeAll('房主长时间离线，自动关房')
+      await this.closeAll('房间长时间无人，已自动关闭')
+      await this.ctx.storage.deleteAlarm()
       await this.ctx.storage.deleteAll()
       this.room = null
       return
     }
-    await this.broadcast() // 让听众知道房主离线状态变化
     await this.ctx.storage.setAlarm(nowMs + 30_000)
   }
 }

@@ -7,7 +7,9 @@
 import {
   applyEvent, createRoomState, genRoomId, genSecret,
   joinRoom, leaveRoom, publicState, signToken, verifyToken,
+  CONTROLLER_OFFLINE_MS, ROOM_AUTO_CLOSE_MS,
 } from '../../core/protocol.js'
+import { probeAudioUrl } from '../../core/probe.js'
 import { RoomStore } from '../store.js'
 
 const CORS = {
@@ -122,15 +124,40 @@ export async function handleJoin(request, roomId) {
   })
 }
 
-export async function handleState(roomId) {
-  const room = await store().get(roomId.toUpperCase())
+export async function handleState(roomId, auth) {
+  const id = roomId.toUpperCase()
+  const nowMs = Date.now()
+  const room = await store().get(id)
   if (!room || room.closed) return err('房间不存在或已关闭', 404)
-  return json({ ok: true, version: room.version, state: publicState(room, Date.now()) })
+  if (auth?.memberId && room.members[auth.memberId]) {
+    // 轮询即心跳：原子刷新请求者在线状态（修复纯轮询客户端被误标离线）
+    await store().update(id, (old) => {
+      if (!old || !old.members[auth.memberId]) return null
+      old.members[auth.memberId].lastSeenMs = nowMs
+      return old
+    })
+    return json({ ok: true, version: room.version, state: publicState(room, nowMs) })
+  }
+  // 惰性自动关房：Serverless 无常驻定时器，靠请求路径触发。
+  // 全员离线且最后活动距今超过宽限期 → 删除房间（URL 随房销毁）。
+  const anyOnline = Object.values(room.members)
+    .some((m) => nowMs - (m.lastSeenMs || 0) < CONTROLLER_OFFLINE_MS)
+  const lastActivity = Math.max(...Object.values(room.members).map((m) => m.lastSeenMs || 0))
+  if (!anyOnline && nowMs - lastActivity >= ROOM_AUTO_CLOSE_MS) {
+    await store().delete(id)
+    return err('房间长时间无人，已自动关闭', 404)
+  }
+  return json({ ok: true, version: room.version, state: publicState(room, nowMs) })
 }
 
 export async function handleControl(request, roomId, auth) {
   const body = await readBody(request)
   const evt = body.event || body
+  // URL 加歌：先探测可用性（确保传上去就能播），失败拒绝并给出原因
+  if (evt?.type === 'ADD_SONG' && evt.track?.sourceId === 'url') {
+    const probe = await probeAudioUrl(evt.track.url)
+    if (!probe.ok) return err(`URL 不可用：${probe.reason}`, 422)
+  }
   const nowMs = Date.now()
   let out = null
   try {
@@ -170,4 +197,29 @@ export async function handleLeave(roomId, auth) {
 
 export async function verifyAuth(roomId, request, url) {
   return verifyToken(tokenSecret(), bearerToken(request, url))
+}
+/** 房主踢人。 */
+export async function handleKick(request, roomId, auth) {
+  const body = await readBody(request)
+  const targetId = String(body.targetId || '')
+  const nowMs = Date.now()
+  const id = roomId.toUpperCase()
+  let out = null
+  try {
+    await store().update(id, (old) => {
+      if (!old || old.closed) { out = { error: '房间不存在或已关闭', code: 404 }; return null }
+      if (old.members[auth.memberId]?.role !== 'controller') {
+        out = { error: '仅房主可操作', code: 403 }; return null
+      }
+      const r = applyEvent(old, auth.memberId, { type: 'KICK', targetId }, nowMs)
+      if (!r.ok) { out = { error: r.error, code: 409 }; return null }
+      out = { ok: true, state: old }
+      return old
+    })
+  } catch (e) {
+    return err(e.message, 500)
+  }
+  if (!out) return err('并发冲突，请重试', 503)
+  if (out.error) return err(out.error, out.code)
+  return json({ ok: true, state: publicState(out.state, Date.now()) })
 }
