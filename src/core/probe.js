@@ -93,5 +93,8 @@ function judgeResponse(r) {
   if (isHls) return { ok: true, contentType: ct }
   if (unknownType && AUDIO_EXT_RE.test(new URL(r.url || '').pathname)) return { ok: true, contentType: ct }
   if (unknownType) return { ok: true, contentType: ct } // 宽松放行：很多直链不给准确 CT
-  return { ok: false, contentType: ct, reason: `不支持的类型 ${ct}` }
+  // 其余非音频 MIME（如 application/x-www-form-urlencoded、application/binary 等）：
+  // 音频 CDN 的 Content-Type 标注普遍不可信，只要能连上且不是网页/JSON 错误体就放行，
+  // 真正不可播会在客户端播放失败时走 TRACK_ERROR 兜底切歌。
+  return { ok: true, contentType: ct }
 }
