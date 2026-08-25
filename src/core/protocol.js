@@ -188,9 +188,20 @@ export function onlineCount(state, nowMs) {
     .filter((m) => nowMs - m.lastSeenMs < CONTROLLER_OFFLINE_MS).length
 }
 /** 加入成员（含重连识别）。返回 {ok, state, memberId, reconnect} 或 {ok:false, error}。 */
-export function joinRoom(state, { nickname, secret }, nowMs) {
+export function joinRoom(state, { nickname, secret, uid }, nowMs) {
   if (state.closed) return { ok: false, error: '房间已关闭' }
-  // 重连：memberSecret 命中已有成员
+  // 重连识别①：uid 命中（设备唯一身份；卸载重装/清数据后仍能归位同一成员）
+  if (uid) {
+    for (const m of Object.values(state.members)) {
+      if (m.uid && m.uid === uid) {
+        if (nickname && validNickname(nickname)) m.nickname = nickname
+        m.lastSeenMs = nowMs
+        state.version++
+        return { ok: true, state, memberId: m.memberId, reconnect: true }
+      }
+    }
+  }
+  // 重连识别②：memberSecret 命中（旧版本客户端兼容）
   for (const m of Object.values(state.members)) {
     if (m.memberSecret && secret && m.memberSecret === secret) {
       m.lastSeenMs = nowMs
@@ -210,6 +221,7 @@ export function joinRoom(state, { nickname, secret }, nowMs) {
   state.members[memberId] = {
     memberId, nickname, role: 'listener',
     joinedAt: nowMs, lastSeenMs: nowMs, memberSecret: null, seq: 0,
+    ...(uid ? { uid } : {}),
   }
   state.version++
   return { ok: true, state, memberId, reconnect: false }
@@ -612,7 +624,7 @@ export function publicState(state, nowMs) {
   const members = Object.fromEntries(Object.entries(state.members).map(([k, m]) => [
     k, {
       ...m,
-      memberSecret: undefined, seq: undefined, lastChatAt: undefined,
+      memberSecret: undefined, seq: undefined, lastChatAt: undefined, uid: undefined,
       /** 该成员是否在线（窗口内有心跳/轮询活动）。 */
       online: nowMs - m.lastSeenMs < CONTROLLER_OFFLINE_MS,
     },

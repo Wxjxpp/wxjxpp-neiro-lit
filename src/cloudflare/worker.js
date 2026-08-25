@@ -61,6 +61,7 @@ export default {
       const body = await request.json().catch(() => ({}))
       const nickname = String(body.nickname || '')
       const roomName = String(body.roomName || '').trim().slice(0, 30)
+      const uid = String(body.uid || '').trim().slice(0, 64)
       if (!nickname) return err('缺少昵称')
       let roomId = ''
       for (let i = 0; i < 8; i++) {
@@ -97,6 +98,7 @@ export default {
       return stub.handleJoin({
         nickname: String(body.nickname || ''),
         secret: String(body.secret || ''),
+        uid: String(body.uid || '').trim().slice(0, 64),
         tokenSecret,
       })
     }
@@ -151,7 +153,7 @@ export class ListeningRoomDO extends DurableObject {
 
   response(data, status = 200) { return json(data, status) }
 
-  async handleCreate({ nickname, roomName, tokenSecret }) {
+  async handleCreate({ nickname, roomName, tokenSecret, uid }) {
     if (await this.load()) return err('房间已存在')
     const nowMs = Date.now()
     const hostMemberId = 'm' + genSecret().slice(0, 12).toLowerCase()
@@ -162,6 +164,7 @@ export class ListeningRoomDO extends DurableObject {
     if (roomName) state.roomName = roomName
     state.joinSecret = joinSecret
     state.members[hostMemberId].memberSecret = memberSecret
+    if (uid) state.members[hostMemberId].uid = uid
     this.room = state
     await this.save()
     await this.ctx.storage.setAlarm(Date.now() + 60_000)
@@ -178,17 +181,18 @@ export class ListeningRoomDO extends DurableObject {
     })
   }
 
-  async handleJoin({ nickname, secret, tokenSecret }) {
+  async handleJoin({ nickname, secret, tokenSecret, uid }) {
     const room = await this.load()
     if (!room) return err('房间不存在', 404)
     const nowMs = Date.now()
-    const r = joinRoom(room, { nickname, secret }, nowMs)
+    const r = joinRoom(room, { nickname, secret, uid }, nowMs)
     if (!r.ok) return err(r.error, 403)
     let memberSecret = r.state.members[r.memberId].memberSecret
     const isNew = !r.reconnect
     if (isNew) {
       memberSecret = genSecret()
       r.state.members[r.memberId].memberSecret = memberSecret
+      if (uid) r.state.members[r.memberId].uid = uid
     }
     await this.save()
     const token = await signToken(tokenSecret, room.roomId, r.memberId, nowMs)
