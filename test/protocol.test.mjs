@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import {
   applyEvent, createRoomState, expectedPositionMs, genRoomId, urlHash, validUrlTrack,
   joinRoom, leaveRoom, publicState, signToken, verifyToken, validTrack, skipNext,
-  onlineCount,
+  onlineCount, advanceIfTrackEnded, gotoIndex,
 } from '../src/core/protocol.js'
 
 const NOW = 1_700_000_000_000
@@ -288,6 +288,30 @@ assert.match(genRoomId(), /^\d{6}$/, '房间号必须是纯数字')
   const r = applyEvent(state, m1, { type: 'CHAT', text: '推进' }, NOW + 1500)
   assert.ok(r.ok, r.error)
   assert.equal(state.playback.track.stableKey, `url:${urlHash('https://a.com/2.mp3')}`)
+}
+// --- 房主点歌单任意曲目（PLAY_INDEX）+ 播完上报推进（TRACK_END）---
+{
+  const s = createRoomState({ roomId: '345678', hostMemberId: HOST, nickname: '房主', nowMs: NOW })
+  s.joinSecret = 'SEC'
+  const DUR = 60_000 // 真实时长，避免宽限值干扰判定
+  applyEvent(s, HOST, { type: 'ADD_SONG', track: { sourceId: 'url', url: 'https://a.com/1.mp3', title: '一', durationMs: DUR } }, NOW)
+  applyEvent(s, HOST, { type: 'ADD_SONG', track: { sourceId: 'url', url: 'https://a.com/2.mp3', title: '二', durationMs: DUR } }, NOW)
+  applyEvent(s, HOST, { type: 'ADD_SONG', track: { sourceId: 'url', url: 'https://a.com/3.mp3', title: '三', durationMs: DUR } }, NOW)
+  // 队列 [1,2,3]，首歌已自动开播（index 0）→ 播完推进到第 2 首
+  advanceIfTrackEnded(s, NOW + DUR + 100)
+  assert.equal(s.playback.track.songId, urlHash('https://a.com/2.mp3'))
+  // 房主点第 3 首（index=2）
+  const rp = applyEvent(s, HOST, { type: 'PLAY_INDEX', index: 2 }, NOW + DUR + 200)
+  assert.ok(rp.ok, rp.error)
+  assert.equal(s.playback.track.songId, urlHash('https://a.com/3.mp3'))
+  assert.equal(s.playback.basePositionMs, 0)
+  // 未播完就上报 → 拒绝
+  const early = applyEvent(s, HOST, { type: 'TRACK_END' }, NOW + DUR + 1500)
+  assert.equal(early.ok, false, '未播完不允许上报')
+  // 播完后上报 → 推进下一首（环形回到第 0 首）
+  const re = applyEvent(s, HOST, { type: 'TRACK_END' }, NOW + DUR + 200 + DUR + 1600)
+  assert.ok(re.ok, re.error)
+  assert.equal(s.playback.track.songId, urlHash('https://a.com/1.mp3'))
 }
 // --- 重名拒绝：同房间内已有成员使用该昵称时，新加入者必须改名 ---
 {

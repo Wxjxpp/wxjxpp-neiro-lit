@@ -35,12 +35,15 @@ export const CONTROL_EVENTS = new Set([
 export const REQUEST_EVENTS = new Set([
   'REQUEST_PLAY', 'REQUEST_PAUSE', 'REQUEST_SEEK', 'REQUEST_SET_TRACK', 'REQUEST_SET_QUEUE',
   'REQUEST_ADD_SONG', 'REQUEST_REMOVE_SONG', 'REQUEST_NEXT', 'REQUEST_PREV', 'REQUEST_TRACK_ERROR',
+  'REQUEST_TRACK_END', 'REQUEST_PLAY_INDEX',
 ])
 const MEMBER_CONTROLLED = new Set([
   'REQUEST_PLAY', 'REQUEST_PAUSE', 'REQUEST_SEEK',
 ])
 /** 全员可用（不受 allowMemberControl 门控）：投票与聊天。 */
 export const OPEN_REQUEST_EVENTS = new Set(['VOTE', 'CHAT'])
+/** 播完上报的宽限毫秒数：期望进度距曲尾不足该值即认可「已播完」。 */
+const TRACK_END_GRACE_MS = 1500
 
 export function genRoomId(random = Math.random) {
   let s = ''
@@ -274,12 +277,21 @@ function resetVotes(state) {
  */
 export function skipNext(state, nowMs) {
   const p = state.playback
+  return gotoIndex(state, p.currentIndex + 1, nowMs)
+}
+/**
+ * 跳到队列第 [idx] 首并开播（环形；跳过 invalid 项，最多扫一整圈）。
+ * NEXT/PREV/PLAY_INDEX/TRACK_END 播完推进共用这一条路径，保证行为一致。
+ */
+export function gotoIndex(state, idx, nowMs) {
+  const p = state.playback
   if (p.queue.length === 0) return toStandby(state, nowMs)
-  for (let i = 0; i < p.queue.length; i++) {
-    const idx = (p.currentIndex + 1 + i) % p.queue.length
-    if (!p.queue[idx].invalid) {
-      p.currentIndex = idx
-      p.track = { ...p.queue[idx] }
+  const n = p.queue.length
+  for (let k = 0; k < n; k++) {
+    const i = ((idx % n) + n) % n
+    if (!p.queue[i].invalid) {
+      p.currentIndex = i
+      p.track = { ...p.queue[i] }
       delete p.track.payload // 队列副本不带 payload；当前曲目按需透传
       p.basePositionMs = 0
       p.anchoredAtMs = nowMs
@@ -287,6 +299,7 @@ export function skipNext(state, nowMs) {
       resetVotes(state)
       return 'switched'
     }
+    idx++
   }
   return toStandby(state, nowMs)
 }
@@ -336,9 +349,14 @@ function maybeDemocraticSkip(state, nowMs) {
  */
 export function advanceIfTrackEnded(state, nowMs) {
   const p = state.playback
-  if (state.closed || !p.playing || !p.track || !p.track.durationMs) return false
-  if (nowMs - p.anchoredAtMs >= p.track.durationMs) {
-    skipNext(state, nowMs)
+  if (state.closed || !p.track || !p.track.durationMs) return false
+  const pos = expectedPositionMs(state, nowMs)
+  // 还没播到结尾：不推进（暂停在中间不算播完）
+  if (pos + 200 < p.track.durationMs) return false
+  // 在播且时间到 → 推进；暂停但停在曲尾（本机播完后的暂停）→ 同样推进。
+  // 后者是关键：房主本机播完会暂停，若不推进整个房间会被冻结在最后一首。
+  if (p.playing || pos >= p.track.durationMs) {
+    gotoIndex(state, p.currentIndex + 1, nowMs)
     return true
   }
   return false
@@ -352,7 +370,10 @@ export function applyEvent(state, actorId, evt, nowMs) {
   const actor = state.members[actorId]
   if (!actor) return { ok: false, error: '不是房间成员' }
   actor.lastSeenMs = nowMs
-  advanceIfTrackEnded(state, nowMs)
+  // 播完上报自己带闸门判定，不走入口预推进（否则曲目先被切走、闸门永远误判）
+  if (evt.type !== 'TRACK_END' && evt.type !== 'REQUEST_TRACK_END') {
+    advanceIfTrackEnded(state, nowMs)
+  }
   // 幂等/乱序防护：同一成员的事件序号必须递增（HEARTBEAT/VOTE 除外——需幂等重试安全）
   if (evt.type !== 'HEARTBEAT' && evt.type !== 'VOTE') {
     const seq = Number(evt.clientSequence)
@@ -403,12 +424,13 @@ export function applyEvent(state, actorId, evt, nowMs) {
   // ---- 群友请求（受门控：加歌只需未锁定；其余需房主开启成员控制）----
   if (REQUEST_EVENTS.has(type)) {
     const action = type.slice(8)
-    // 点歌与无效源上报不依赖房主设置（基础功能与安全兜底）
-    if (action !== 'ADD_SONG' && action !== 'TRACK_ERROR' && !state.settings.allowMemberControl) {
+    // 点歌/无效源上报/播完推进不依赖房主设置（基础功能与安全兜底）
+    if (action !== 'ADD_SONG' && action !== 'TRACK_ERROR' && action !== 'TRACK_END' &&
+        !state.settings.allowMemberControl) {
       return { ok: false, error: '房主未开启成员控制' }
     }
-    // 点歌/无效源上报也不要求房主在线；其余控制类请求需要房主在线兜底
-    if (action !== 'ADD_SONG' && action !== 'TRACK_ERROR' &&
+    // 点歌/无效源上报/播完推进也不要求房主在线；其余控制类请求需要房主在线兜底
+    if (action !== 'ADD_SONG' && action !== 'TRACK_ERROR' && action !== 'TRACK_END' &&
         !controllerOnline(state, nowMs)) return { ok: false, error: '房主不在线' }
     if (MEMBER_CONTROLLED.has(type)) {
       const want = evt.requestTrackStableKey || (evt.track && stableKeyOf(evt.track)) || ''
@@ -512,11 +534,34 @@ function applyControl(state, action, evt, nowMs, actorNick = '', isHost = false)
       break
     }
     case 'NEXT':
-      skipNext(state, nowMs)
+      gotoIndex(state, p.currentIndex + 1, nowMs)
       break
     case 'PREV':
-      skipPrev(state, nowMs)
+      gotoIndex(state, p.currentIndex - 1, nowMs)
       break
+    /**
+     * 房主点歌单任意曲目开播（客户端把队列下标发上来）。
+     */
+    case 'PLAY_INDEX': {
+      const idx = Math.floor(Number(evt.index))
+      if (!Number.isFinite(idx)) return { ok: false, error: 'index 非法' }
+      gotoIndex(state, idx, nowMs)
+      break
+    }
+    /**
+     * 播完上报：任一成员本机播完当前曲目即推进下一首。
+     * 以服务端期望进度超过曲目时长为闸，防止提前上报/重复触发；
+     * 这是「房主离线也能连续放歌」的核心事件。
+     */
+    case 'TRACK_END': {
+      const cur = p.track
+      if (!cur) return { ok: false, error: '当前没有曲目' }
+      if (expectedPositionMs(state, nowMs) < (cur.durationMs || 0) - TRACK_END_GRACE_MS) {
+        return { ok: false, error: '歌曲尚未播完' }
+      }
+      gotoIndex(state, p.currentIndex + 1, nowMs)
+      break
+    }
     /**
      * 无效源兜底：客户端 URL 失效/加载超时(>5s)上报，标记并立即跳过。
      */
