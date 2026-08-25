@@ -18,7 +18,7 @@ function joinListener(state, nick, at) {
   return r.memberId
 }
 // --- 房间号 ---
-assert.match(genRoomId(), /^[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{6}$/)
+assert.match(genRoomId(), /^\d{6}$/, '房间号必须是纯数字')
 // --- URL 音源：哈希稳定 + 校验 ---
 {
   const u = 'https://cdn.example.com/song.mp3'
@@ -288,6 +288,19 @@ assert.match(genRoomId(), /^[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{6}$/)
   const r = applyEvent(state, m1, { type: 'CHAT', text: '推进' }, NOW + 1500)
   assert.ok(r.ok, r.error)
   assert.equal(state.playback.track.stableKey, `url:${urlHash('https://a.com/2.mp3')}`)
+}
+// --- 重名拒绝：同房间内已有成员使用该昵称时，新加入者必须改名 ---
+{
+  const s = createRoomState({ roomId: '234567', hostMemberId: HOST, nickname: '房主', nowMs: NOW })
+  s.joinSecret = 'SEC'
+  const a = joinRoom(s, { nickname: '小明', secret: 'SEC' }, NOW + 1)
+  assert.equal(a.ok, true)
+  const dup = joinRoom(s, { nickname: '小明', secret: 'SEC' }, NOW + 2)
+  assert.equal(dup.ok, false, '重名必须被拒绝')
+  assert.equal(dup.code, 'NAME_TAKEN')
+  // 改名后可正常加入
+  const b = joinRoom(s, { nickname: '小红', secret: 'SEC' }, NOW + 3)
+  assert.equal(b.ok, true)
 }
 // --- 脱敏快照 ---
 {

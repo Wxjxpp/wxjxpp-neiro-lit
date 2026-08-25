@@ -52,7 +52,7 @@ export default {
       tokenSecret = await env.ROOMS.get(env.ROOMS.idFromName('__secret__')).getOrCreateTokenSecret()
     }
 
-    const m = url.pathname.match(/^\/api\/rooms\/([A-Za-z0-9]{6})(\/(ws|state|join|leave|control|kick))?$/)
+    const m = url.pathname.match(/^\/api\/rooms\/(\d{6})(\/(ws|state|join|leave|control|kick))?$/)
     if (!m && url.pathname !== '/api/rooms') return err('not found', 404)
 
     // 创建房间
@@ -60,6 +60,7 @@ export default {
       if (request.method !== 'POST') return err('method not allowed', 405)
       const body = await request.json().catch(() => ({}))
       const nickname = String(body.nickname || '')
+      const roomName = String(body.roomName || '').trim().slice(0, 30)
       if (!nickname) return err('缺少昵称')
       let roomId = ''
       for (let i = 0; i < 8; i++) {
@@ -70,7 +71,7 @@ export default {
       }
       if (!roomId) return err('房间号分配失败，请重试', 503)
       const stub = env.ROOMS.get(env.ROOMS.idFromName(roomId))
-      return stub.handleCreate({ nickname, tokenSecret })
+      return stub.handleCreate({ nickname, roomName, tokenSecret })
     }
 
     const roomId = m[1].toUpperCase()
@@ -150,7 +151,7 @@ export class ListeningRoomDO extends DurableObject {
 
   response(data, status = 200) { return json(data, status) }
 
-  async handleCreate({ nickname, tokenSecret }) {
+  async handleCreate({ nickname, roomName, tokenSecret }) {
     if (await this.load()) return err('房间已存在')
     const nowMs = Date.now()
     const hostMemberId = 'm' + genSecret().slice(0, 12).toLowerCase()
@@ -158,6 +159,7 @@ export class ListeningRoomDO extends DurableObject {
     const memberSecret = genSecret()
     const state = createRoomState({ roomId: '', hostMemberId, nickname, nowMs })
     state.roomId = this.ctx.id.name || ''
+    if (roomName) state.roomName = roomName
     state.joinSecret = joinSecret
     state.members[hostMemberId].memberSecret = memberSecret
     this.room = state

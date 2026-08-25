@@ -12,7 +12,7 @@
  * - 身份：joinSecret（邀请首次入房）+ memberSecret（重连）+ HMAC Token（24h）。
  * - 密钥绝不出现在脱敏快照中。
  */
-export const ROOM_ID_ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ'
+export const ROOM_ID_ALPHABET = '0123456789'
 export const ROOM_ID_LENGTH = 6
 export const QUEUE_LIMIT = 500
 export const TOKEN_TTL_MS = 24 * 60 * 60 * 1000
@@ -198,6 +198,11 @@ export function joinRoom(state, { nickname, secret }, nowMs) {
   if (!validNickname(nickname)) return { ok: false, error: '昵称不合法（1-24 位中文/字母/数字）' }
   if (!state.joinSecret || secret !== state.joinSecret) return { ok: false, error: '邀请密钥错误' }
   if (Object.keys(state.members).length >= 50) return { ok: false, error: '房间人数已满' }
+  // 重名拒绝：同房间内已有成员使用该昵称时，新加入者必须改名
+  const taken = Object.values(state.members).some(
+    (m) => m.nickname === nickname && !(m.memberSecret && secret && m.memberSecret === secret),
+  )
+  if (taken) return { ok: false, code: 'NAME_TAKEN', error: '该名称已被占用，换一个吧' }
   const memberId = 'm' + genSecret().slice(0, 12).toLowerCase()
   state.members[memberId] = {
     memberId, nickname, role: 'listener',
@@ -560,7 +565,12 @@ function normalizeQueue(incoming, fallback) {
 export function publicState(state, nowMs) {
   const { joinSecret, ...rest } = state
   const members = Object.fromEntries(Object.entries(state.members).map(([k, m]) => [
-    k, { ...m, memberSecret: undefined, seq: undefined, lastChatAt: undefined },
+    k, {
+      ...m,
+      memberSecret: undefined, seq: undefined, lastChatAt: undefined,
+      /** 该成员是否在线（窗口内有心跳/轮询活动）。 */
+      online: nowMs - m.lastSeenMs < CONTROLLER_OFFLINE_MS,
+    },
   ]))
   return {
     ...rest,

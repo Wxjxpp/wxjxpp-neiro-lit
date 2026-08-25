@@ -52,6 +52,7 @@ async function readBody(request) {
 export async function handleCreateRoom(request) {
   const body = await readBody(request)
   const nickname = String(body.nickname || '')
+  const roomName = String(body.roomName || '').trim().slice(0, 30)
   if (!nickname) return err('缺少昵称')
   const nowMs = Date.now()
   for (let i = 0; i < 8; i++) {
@@ -63,6 +64,7 @@ export async function handleCreateRoom(request) {
         if (old) return null // 已存在，换号重试
         const hostMemberId = `m${genSecret().slice(0, 12).toLowerCase()}`
         const s = createRoomState({ roomId, hostMemberId, nickname, nowMs })
+        if (roomName) s.roomName = roomName
         s.joinSecret = genSecret()
         s.members[hostMemberId].memberSecret = genSecret()
         s._created = { joinSecret: s.joinSecret, memberSecret: s.members[hostMemberId].memberSecret }
